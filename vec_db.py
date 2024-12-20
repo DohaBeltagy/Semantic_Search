@@ -126,38 +126,32 @@ class VecDB:
         return np.array(vectors)
     
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5):
-    # Step 1: Compute similarity scores with the Level 1 centroids
-        centroid_scores_level1 = []
-        for i, centroid in enumerate(self.centroids_level1):
-            score = self._cal_score(query, centroid)
-            centroid_scores_level1.append((score, i))
-        
-        # Step 2: Sort Level 1 centroids and select top 2 closest centroids
-        closest_level1_centroids = [x[1] for x in sorted(centroid_scores_level1, reverse=True)[:2]]
-        
-        # Step 3: Search within the inverted lists of the closest Level 1 centroids
-        candidates = []
+        # Compute Level 1 centroid scores and retrieve top-n
+        centroid_scores_level1 = np.dot(self.centroids_level1, query.T).flatten()
+        closest_level1_centroids = np.argsort(-centroid_scores_level1)[:2]  # Select top 2
+
+        # Aggregate candidate vectors from Level 2 clusters
+        candidate_vectors = []
         for level1_idx in closest_level1_centroids:
-            # For each Level 1 centroid, get the corresponding nested centroids (Level 2)
-            for nested_centroid_idx, nested_centroid in enumerate(self.nested_centroids.get(level1_idx, [])):
-                # Step 4: Compute score with the nested centroid (Level 2 centroid)
-                score = self._cal_score(query, nested_centroid)
-                candidates.append((score, level1_idx, nested_centroid_idx))  # Store scores along with cluster info
+            if level1_idx in self.nested_centroids:
+                level2_centroids = self.nested_centroids[level1_idx]
+                centroid_scores_level2 = np.dot(level2_centroids, query.T).flatten()
+                closest_level2_centroids = np.argsort(-centroid_scores_level2)[:top_k]
+
+                # Collect vector IDs from Level 2 inverted lists
+                for centroid_idx in closest_level2_centroids:
+                    candidate_vectors.extend(
+                        self.nested_inverted_lists[level1_idx].get(centroid_idx, [])
+                    )
         
-        # Step 5: Sort candidates by score and select top-k from Level 2
-        candidates = sorted(candidates, reverse=True)[:top_k]
+        # Compute scores for final candidates
+        candidate_vectors = list(set(candidate_vectors))  # Remove duplicates
+        all_vectors = self.get_all_rows()[candidate_vectors]
+        scores = np.dot(all_vectors, query.T).flatten()
+        top_candidates = np.argsort(-scores)[:top_k]
         
-        # Step 6: Collect vector IDs from the nested inverted lists
-        final_candidates = []
-        for score, level1_idx, nested_centroid_idx in candidates:
-            # Get the vector IDs from the nested inverted lists (Level 2)
-            vector_ids = self.nested_inverted_lists.get(level1_idx, {}).get(nested_centroid_idx, [])
-            for vector_id in vector_ids:
-                final_candidates.append((score, vector_id))
-        
-        # Step 7: Sort the final candidates by score and return the top-k vector IDs
-        final_candidates = sorted(final_candidates, reverse=True)[:top_k]
-        return [x[1] for x in final_candidates]
+        return [(scores[i], candidate_vectors[i]) for i in top_candidates]
+
     
     def _cal_score(self, vec1, vec2):
         dot_product = np.dot(vec1, vec2)
