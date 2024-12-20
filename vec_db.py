@@ -126,31 +126,31 @@ class VecDB:
         return np.array(vectors)
     
     def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k=5):
-        # Compute Level 1 centroid scores and retrieve top-n
+        # Compute cosine similarity with Level 1 centroids
         centroid_scores_level1 = np.dot(self.centroids_level1, query.T).flatten()
-        closest_level1_centroids = np.argsort(-centroid_scores_level1)[:2]  # Select top 2
+        norm_query = np.linalg.norm(query)
+        centroid_scores_level1 /= (np.linalg.norm(self.centroids_level1, axis=1) * norm_query)
 
-        # Aggregate candidate vectors from Level 2 clusters
-        candidate_vectors = []
-        for level1_idx in closest_level1_centroids:
+        # Get top 2 closest Level 1 centroids
+        closest_level1_idxs = np.argsort(centroid_scores_level1)[-2:][::-1]
+
+        # Retrieve candidates from Level 2 clusters
+        candidates = []
+        for level1_idx in closest_level1_idxs:
             if level1_idx in self.nested_centroids:
-                level2_centroids = self.nested_centroids[level1_idx]
-                centroid_scores_level2 = np.dot(level2_centroids, query.T).flatten()
-                closest_level2_centroids = np.argsort(-centroid_scores_level2)[:top_k]
+                nested_centroids = self.nested_centroids[level1_idx]
+                centroid_scores_level2 = np.dot(nested_centroids, query.T).flatten()
+                centroid_scores_level2 /= (np.linalg.norm(nested_centroids, axis=1) * norm_query)
 
-                # Collect vector IDs from Level 2 inverted lists
-                for centroid_idx in closest_level2_centroids:
-                    candidate_vectors.extend(
-                        self.nested_inverted_lists[level1_idx].get(centroid_idx, [])
-                    )
-        
-        # Compute scores for final candidates
-        candidate_vectors = list(set(candidate_vectors))  # Remove duplicates
-        all_vectors = self.get_all_rows()[candidate_vectors]
-        scores = np.dot(all_vectors, query.T).flatten()
-        top_candidates = np.argsort(-scores)[:top_k]
-        
-        return [(scores[i], candidate_vectors[i]) for i in top_candidates]
+                top_nested_idxs = np.argsort(centroid_scores_level2)[-top_k:][::-1]
+                for nested_idx in top_nested_idxs:
+                    vector_ids = self.nested_inverted_lists.get(level1_idx, {}).get(nested_idx, [])
+                    candidates.extend([(centroid_scores_level2[nested_idx], vid) for vid in vector_ids])
+
+        # Return top-k results
+        candidates = sorted(candidates, reverse=True, key=lambda x: x[0])[:top_k]
+        return [x[1] for x in candidates]
+
 
     
     def _cal_score(self, vec1, vec2):
@@ -199,47 +199,47 @@ class VecDB:
                     writer.writerow([cluster_idx] + vector_ids)
 
     def _build_index(self):
-
         num_records = self._get_num_records()
         if num_records == 0:
             raise ValueError("The database is empty. Add records before building the index.")
         
+        # Load data in manageable chunks
         data = self.get_all_rows()
 
-        # Level 1 clustering (coarse clusters)
-        minibatch_kmeans_level1 = MiniBatchKMeans(n_clusters=self.nlist, random_state=DB_SEED_NUMBER, batch_size=1000)
+        # Level 1 clustering
+        minibatch_kmeans_level1 = MiniBatchKMeans(
+            n_clusters=self.nlist,
+            random_state=DB_SEED_NUMBER,
+            batch_size=1024  # Smaller batch size for memory efficiency
+        )
         minibatch_kmeans_level1.fit(data)
         self.centroids_level1 = minibatch_kmeans_level1.cluster_centers_
-        
-        # Create inverted lists for Level 1
-        cluster_assignments_level1 = minibatch_kmeans_level1.labels_
+
+        # Assign vectors to Level 1 clusters
+        cluster_assignments_level1 = minibatch_kmeans_level1.predict(data)
         self.inverted_lists_level1 = {i: [] for i in range(self.nlist)}
         for idx, cluster_idx in enumerate(cluster_assignments_level1):
             self.inverted_lists_level1[cluster_idx].append(idx)
-        
-        # Now, for each cluster in Level 1, perform Level 2 clustering
+
+        # Level 2 clustering within each Level 1 cluster
         self.nested_centroids = {}
         self.nested_inverted_lists = {}
-        
-        for level1_idx, level1_vectors in self.inverted_lists_level1.items():
-            # Get the vectors assigned to this cluster
-            level1_cluster_vectors = data[level1_vectors]
-            
-            # Level 2 clustering (sub-clusters within each Level 1 cluster)
-            minibatch_kmeans_level2 = MiniBatchKMeans(n_clusters=self.nlist // 2, random_state=DB_SEED_NUMBER, batch_size=1000)
-            minibatch_kmeans_level2.fit(level1_cluster_vectors)
-            
-            level2_centroids = minibatch_kmeans_level2.cluster_centers_
-            self.nested_centroids[level1_idx] = level2_centroids
-            
-            # Create inverted lists for Level 2
-            cluster_assignments_level2 = minibatch_kmeans_level2.labels_
-            inverted_lists_level2 = {i: [] for i in range(self.nlist // 2)}
-            for idx, cluster_idx in enumerate(cluster_assignments_level2):
-                inverted_lists_level2[cluster_idx].append(level1_vectors[idx])  # Store original level 1 indices
-            
-            self.nested_inverted_lists[level1_idx] = inverted_lists_level2
-        
-        # Save the nested structure (if needed)
-        self._save_index()
+        for level1_idx, vector_indices in self.inverted_lists_level1.items():
+            cluster_data = data[vector_indices]
 
+            if len(cluster_data) > 0:
+                minibatch_kmeans_level2 = MiniBatchKMeans(
+                    n_clusters=min(self.nlist // 2, len(cluster_data)),  # Adaptive cluster count
+                    random_state=DB_SEED_NUMBER,
+                    batch_size=512
+                )
+                minibatch_kmeans_level2.fit(cluster_data)
+                self.nested_centroids[level1_idx] = minibatch_kmeans_level2.cluster_centers_
+
+                # Assign vectors to Level 2 clusters
+                cluster_assignments_level2 = minibatch_kmeans_level2.predict(cluster_data)
+                inverted_lists_level2 = {i: [] for i in range(len(self.nested_centroids[level1_idx]))}
+                for idx, cluster_idx in enumerate(cluster_assignments_level2):
+                    inverted_lists_level2[cluster_idx].append(vector_indices[idx])
+                
+                self.nested_inverted_lists[level1_idx] = inverted_lists_level2
